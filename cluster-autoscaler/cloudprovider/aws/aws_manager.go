@@ -403,8 +403,6 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 	node.Status.Capacity[apiv1.ResourcePods] = *resource.NewQuantity(110, resource.DecimalSI)
 	node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewQuantity(template.InstanceType.VCPU, resource.DecimalSI)
 	node.Status.Capacity[gpu.ResourceNvidiaGPU] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
-	node.Status.Capacity["directx.microsoft.com/display"] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
-	node.Status.Capacity["vpc.amazonaws.com/PrivateIPv4Address"] = *resource.NewQuantity(1, resource.DecimalSI)
 	node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(template.InstanceType.MemoryMb*1024*1024, resource.DecimalSI)
 
 	if err := m.updateCapacityWithRequirementsOverrides(&node.Status.Capacity, asg.MixedInstancesPolicy); err != nil {
@@ -426,6 +424,12 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 	node.Labels = cloudprovider.JoinStringMaps(node.Labels, extractLabelsFromAsg(template.Tags))
 
 	node.Spec.Taints = extractTaintsFromAsg(template.Tags)
+
+	// Attach directx and ipv4 resource requests if the node OS is windows
+	if val, ok := node.Labels["kubernetes.io/os"]; ok && val == "windows" {
+		node.Status.Capacity["directx.microsoft.com/display"] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
+		node.Status.Capacity["vpc.amazonaws.com/PrivateIPv4Address"] = *resource.NewQuantity(50, resource.DecimalSI)
+	}
 
 	if nodegroupName, clusterName := node.Labels["nodegroup-name"], node.Labels["cluster-name"]; nodegroupName != "" && clusterName != "" {
 		klog.V(5).Infof("Nodegroup %s in cluster %s is an EKS managed nodegroup.", nodegroupName, clusterName)
