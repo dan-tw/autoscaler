@@ -427,7 +427,11 @@ func (m *AwsManager) buildNodeFromTemplate(asg *asg, template *asgTemplate) (*ap
 
 	// Attach directx and ipv4 resource requests if the node OS is windows
 	if val, ok := node.Labels["kubernetes.io/os"]; ok && val == "windows" {
-		node.Status.Capacity["directx.microsoft.com/display"] = *resource.NewQuantity(template.InstanceType.GPU, resource.DecimalSI)
+
+		// we get the number of available GPU's per node from an env var that is passed down via the spsconfig
+		windowsGPUs, _ := strconv.Atoi(os.Getenv("WDDM_DEVICE_PLUGIN_MULTITENANCY"))
+
+		node.Status.Capacity["directx.microsoft.com/display"] = *resource.NewQuantity(int64(windowsGPUs), resource.DecimalSI)
 		node.Status.Capacity["vpc.amazonaws.com/PrivateIPv4Address"] = *resource.NewQuantity(50, resource.DecimalSI)
 	}
 
