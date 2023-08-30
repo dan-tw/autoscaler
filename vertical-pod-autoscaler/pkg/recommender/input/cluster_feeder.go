@@ -46,19 +46,21 @@ import (
 	v1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	klog "k8s.io/klog/v2"
+	"k8s.io/klog/v2"
 	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 )
 
 const (
-	evictionWatchRetryWait                     = 10 * time.Second
-	evictionWatchJitterFactor                  = 0.5
-	scaleCacheLoopPeriod         time.Duration = 7 * time.Second
-	scaleCacheEntryLifetime      time.Duration = time.Hour
-	scaleCacheEntryFreshnessTime time.Duration = 10 * time.Minute
-	scaleCacheEntryJitterFactor  float64       = 1.
-	defaultResyncPeriod          time.Duration = 10 * time.Minute
-	defaultRecommenderName                     = "default"
+	evictionWatchRetryWait               = 10 * time.Second
+	evictionWatchJitterFactor            = 0.5
+	scaleCacheLoopPeriod                 = 7 * time.Second
+	scaleCacheEntryLifetime              = time.Hour
+	scaleCacheEntryFreshnessTime         = 10 * time.Minute
+	scaleCacheEntryJitterFactor  float64 = 1.
+	defaultResyncPeriod                  = 10 * time.Minute
+	// DefaultRecommenderName designates the recommender that will handle VPA objects which don't specify
+	// recommender name explicitly (and so implicitly specify that the default recommender should handle them)
+	DefaultRecommenderName = "default"
 )
 
 // ClusterStateFeeder can update state of ClusterState object.
@@ -94,6 +96,7 @@ type ClusterStateFeederFactory struct {
 	SelectorFetcher     target.VpaTargetSelectorFetcher
 	MemorySaveMode      bool
 	ControllerFetcher   controllerfetcher.ControllerFetcher
+	RecommenderName     string
 }
 
 // Make creates new ClusterStateFeeder with internal data providers, based on kube client.
@@ -109,12 +112,13 @@ func (m ClusterStateFeederFactory) Make() *clusterStateFeeder {
 		selectorFetcher:     m.SelectorFetcher,
 		memorySaveMode:      m.MemorySaveMode,
 		controllerFetcher:   m.ControllerFetcher,
+		recommenderName:     m.RecommenderName,
 	}
 }
 
 // NewClusterStateFeeder creates new ClusterStateFeeder with internal data providers, based on kube client config.
 // Deprecated; Use ClusterStateFeederFactory instead.
-func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState, memorySave bool, namespace, metricsClientName string) ClusterStateFeeder {
+func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState, memorySave bool, namespace, metricsClientName string, recommenderName string) ClusterStateFeeder {
 	kubeClient := kube_client.NewForConfigOrDie(config)
 	podLister, oomObserver := NewPodListerAndOOMObserver(kubeClient, namespace)
 	factory := informers.NewSharedInformerFactoryWithOptions(kubeClient, defaultResyncPeriod, informers.WithNamespace(namespace))
@@ -131,6 +135,7 @@ func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState
 		SelectorFetcher:     target.NewVpaTargetSelectorFetcher(config, kubeClient, factory),
 		MemorySaveMode:      memorySave,
 		ControllerFetcher:   controllerFetcher,
+		RecommenderName:     recommenderName,
 	}.Make()
 }
 
@@ -224,6 +229,7 @@ type clusterStateFeeder struct {
 	selectorFetcher     target.VpaTargetSelectorFetcher
 	memorySaveMode      bool
 	controllerFetcher   controllerfetcher.ControllerFetcher
+	recommenderName     string
 }
 
 func (feeder *clusterStateFeeder) InitFromHistoryProvider(historyProvider history.HistoryProvider) {
@@ -304,13 +310,13 @@ func (feeder *clusterStateFeeder) GarbageCollectCheckpoints() {
 	klog.V(3).Info("Starting garbage collection of checkpoints")
 	feeder.LoadVPAs()
 
-	namspaceList, err := feeder.coreClient.Namespaces().List(context.TODO(), metav1.ListOptions{})
+	namespaceList, err := feeder.coreClient.Namespaces().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		klog.Errorf("Cannot list namespaces. Reason: %+v", err)
 		return
 	}
 
-	for _, namespaceItem := range namspaceList.Items {
+	for _, namespaceItem := range namespaceList.Items {
 		namespace := namespaceItem.Name
 		checkpointList, err := feeder.vpaCheckpointClient.VerticalPodAutoscalerCheckpoints(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
@@ -349,17 +355,27 @@ func filterVPAs(feeder *clusterStateFeeder, allVpaCRDs []*vpa_types.VerticalPodA
 	klog.V(3).Infof("Start selecting the vpaCRDs.")
 	var vpaCRDs []*vpa_types.VerticalPodAutoscaler
 	for _, vpaCRD := range allVpaCRDs {
-		currentRecommenderName := defaultRecommenderName
-		if !implicitDefaultRecommender(vpaCRD.Spec.Recommenders) && !selectsRecommender(vpaCRD.Spec.Recommenders, &currentRecommenderName) {
-			klog.V(6).Infof("Ignoring vpaCRD %s in namespace %s as current recommender's name %v doesn't appear among its recommenders", vpaCRD.Name, vpaCRD.Namespace, currentRecommenderName)
-			continue
+		if feeder.recommenderName == DefaultRecommenderName {
+			if !implicitDefaultRecommender(vpaCRD.Spec.Recommenders) && !selectsRecommender(vpaCRD.Spec.Recommenders, &feeder.recommenderName) {
+				klog.V(6).Infof("Ignoring vpaCRD %s in namespace %s as current recommender's name %v doesn't appear among its recommenders", vpaCRD.Name, vpaCRD.Namespace, feeder.recommenderName)
+				continue
+			}
+		} else {
+			if implicitDefaultRecommender(vpaCRD.Spec.Recommenders) {
+				klog.V(6).Infof("Ignoring vpaCRD %s in namespace %s as %v recommender doesn't process CRDs implicitly destined to %v recommender", vpaCRD.Name, vpaCRD.Namespace, feeder.recommenderName, DefaultRecommenderName)
+				continue
+			}
+			if !selectsRecommender(vpaCRD.Spec.Recommenders, &feeder.recommenderName) {
+				klog.V(6).Infof("Ignoring vpaCRD %s in namespace %s as current recommender's name %v doesn't appear among its recommenders", vpaCRD.Name, vpaCRD.Namespace, feeder.recommenderName)
+				continue
+			}
 		}
 		vpaCRDs = append(vpaCRDs, vpaCRD)
 	}
 	return vpaCRDs
 }
 
-// Fetch VPA objects and load them into the cluster state.
+// LoadVPAs fetches VPA objects and loads them into the cluster state.
 func (feeder *clusterStateFeeder) LoadVPAs() {
 	// List VPA API objects.
 	allVpaCRDs, err := feeder.vpaLister.List(labels.Everything())
@@ -408,7 +424,7 @@ func (feeder *clusterStateFeeder) LoadVPAs() {
 	feeder.clusterState.ObservedVpas = vpaCRDs
 }
 
-// Load pod into the cluster state.
+// LoadPods loads pod into the cluster state.
 func (feeder *clusterStateFeeder) LoadPods() {
 	podSpecs, err := feeder.specClient.GetPodSpecs()
 	if err != nil {

@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -62,13 +62,6 @@ type Error struct {
 	RetryAfter time.Time
 	// RetryAfter indicates the raw error from API.
 	RawError error
-}
-
-// RawErrorContainer is the container of the Error.RawError
-type RawErrorContainer struct {
-	Code    string   `json:"code"`
-	Message string   `json:"message"`
-	Details []string `json:"details"`
 }
 
 // Error returns the error.
@@ -198,8 +191,8 @@ func getRawError(resp *http.Response, err error) error {
 
 	// return the http status if it is unable to get response body.
 	defer resp.Body.Close()
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	resp.Body = ioutil.NopCloser(bytes.NewReader(respBody))
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 	if len(respBody) == 0 {
 		return fmt.Errorf("HTTP status code (%d)", resp.StatusCode)
 	}
@@ -262,22 +255,35 @@ func getRetryAfter(resp *http.Response) time.Duration {
 	return dur
 }
 
-// GetErrorWithRetriableHTTPStatusCodes gets an error with RetriableHTTPStatusCodes.
-// It is used to retry on some HTTPStatusCodes.
-func GetErrorWithRetriableHTTPStatusCodes(resp *http.Response, err error, retriableHTTPStatusCodes []int) *Error {
-	rerr := GetError(resp, err)
+// IsInHTTPStatusCodeSet return true when status code falls in the status code list
+// It is used with doBackoffRetry to retry on some HTTPStatusCodes.
+func IsInHTTPStatusCodeSet(rerr *Error, httpStatusCodes []int) bool {
 	if rerr == nil {
-		return nil
+		return false
 	}
-
-	for _, code := range retriableHTTPStatusCodes {
+	for _, code := range httpStatusCodes {
 		if rerr.HTTPStatusCode == code {
-			rerr.Retriable = true
-			break
+			return true
 		}
 	}
 
-	return rerr
+	return false
+}
+
+// isInErrorsSet return true when error message falls in the error message set
+// It is used with doBackoffRetry to retry on some errors.
+func isInErrorsSet(rerr *Error, errorMsgs []string) bool {
+
+	if rerr == nil {
+		return false
+	}
+
+	for _, err := range errorMsgs {
+		if strings.Contains(rerr.RawError.Error(), err) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetStatusNotFoundAndForbiddenIgnoredError gets an error with StatusNotFound and StatusForbidden ignored.
@@ -339,7 +345,7 @@ func GetVMSSMetadataByRawError(err *Error) (string, string, error) {
 	reg := regexp.MustCompile(`.*/subscriptions/(?:.*)/resourceGroups/(.*)/providers/Microsoft.Compute/virtualMachineScaleSets/(.+).`)
 	matches := reg.FindStringSubmatch(err.ServiceErrorMessage())
 	if len(matches) != 3 {
-		return "", "", fmt.Errorf("GetVMSSMetadataByRawError: couldn't find a VMSS resource Id from error message %s", err.RawError)
+		return "", "", fmt.Errorf("GetVMSSMetadataByRawError: couldn't find a VMSS resource Id from error message %w", err.RawError)
 	}
 
 	return matches[1], matches[2], nil
@@ -411,4 +417,17 @@ func getOperationNotAllowedReason(msg string) string {
 		return QuotaExceeded
 	}
 	return OperationNotAllowed
+}
+
+// PartialUpdateError implements error interface. It is meant to be returned for errors with http status code of 2xx
+type PartialUpdateError struct {
+	message string
+}
+
+func NewPartialUpdateError(msg string) *PartialUpdateError {
+	return &PartialUpdateError{message: msg}
+}
+
+func (e *PartialUpdateError) Error() string {
+	return e.message
 }
